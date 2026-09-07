@@ -1,0 +1,11 @@
+torch>=2.5
+diffusers
+transformers
+einops
+numpy
+scipy
+decord
+imageio[ffmpeg]
+ftfy
+regex
+easydict
