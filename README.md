@@ -8,6 +8,10 @@ joint multi-camera inference. It also contains a small, reproducible
 Infinigen CPU-preparation and GPU-rendering workflow under
 [`infinigen/`](infinigen/README.md).
 
+![ConsistWorld qualitative results](assets/teaser.png)
+
+![ConsistWorld memory and cross-view attention](assets/method.png)
+
 The 14B model is not practical on a CPU. Cache construction, training, and
 inference require CUDA or Ascend NPU; CPU-only hosts can run metadata, format,
 trajectory, and checkpoint-format checks. The entry points fail early with a
