@@ -1,4 +1,4 @@
-"""Build the packed latent cache consumed by PaperA training.
+"""Build the packed latent cache consumed by ConsistWorld training.
 
 The input is a SpatialVID-style directory containing matching ``.mp4`` and
 ``.json`` files named ``<scene>__camNN``. Every output scene is self-contained:
@@ -24,7 +24,7 @@ from wan.configs import WAN_CONFIGS
 from wan.dataset.local_dataset import SpatialVidDataset
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae2_1 import Wan2_1_VAE
-from wan.utils.accel import device_module, device_type, is_cuda
+from wan.utils.accel import device_module, device_type, is_cuda, require_accelerator
 from wan.utils.prompt_template import compose_scene_text_condition
 from wan.utils.stage1_ar_geometry import Stage1ARGeometry
 
@@ -133,7 +133,7 @@ def _camera_name(sample: dict) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build PaperA packed VAE/T5 clip caches")
+    parser = argparse.ArgumentParser(description="Build ConsistWorld packed VAE/T5 clip caches")
     parser.add_argument("--pretrained_model_root", required=True)
     parser.add_argument("--navigation_roots", nargs="+", required=True)
     parser.add_argument("--out_dir", required=True)
@@ -147,6 +147,7 @@ def main() -> None:
     parser.add_argument("--max_scenes", type=int, default=0)
     args = parser.parse_args()
 
+    require_accelerator("Cache construction")
     encoder = ClipEncoder(args.pretrained_model_root, args.chunk_size)
     dataset = SpatialVidDataset(
         roots=args.navigation_roots,

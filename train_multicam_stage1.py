@@ -1,4 +1,4 @@
-"""Train the MultiCamData rolling SR-v3 warm start used by PaperA."""
+"""Train the MultiCamData rolling SR-v3 warm start used by ConsistWorld."""
 from __future__ import annotations
 
 import argparse
@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
-from train_papera import (
+from train_consistworld import (
     LingbotStage1ARTrainer,
     Stage1ARTrainingConfig,
     create_dataloader,
@@ -21,7 +21,7 @@ from wan.utils.stage1_ar_selfresample import ar_seq_len, rho_curriculum
 
 @dataclass
 class MultiCamStage1Config(Stage1ARTrainingConfig):
-    """The fixed rolling recipe that produced the Stage-1 PaperA initializer."""
+    """The fixed rolling recipe that produced the Stage-1 ConsistWorld initializer."""
 
     max_steps: int = 6000
     warmup_steps: int = 500
@@ -37,7 +37,7 @@ class MultiCamStage1Config(Stage1ARTrainingConfig):
 
 
 class MultiCamStage1Trainer(LingbotStage1ARTrainer):
-    """Stage 1 without the PaperA-only retrieval and geometry-gate paths."""
+    """Stage 1 without the ConsistWorld-only retrieval and geometry-gate paths."""
 
     def _prepare_batch_ar(self, batch):
         (

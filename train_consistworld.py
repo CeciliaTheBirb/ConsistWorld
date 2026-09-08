@@ -37,9 +37,10 @@ from wan.utils.accel import (
     device_type,
     empty_cache as accel_empty_cache,
     is_cuda,
+    require_accelerator,
     synchronize as accel_synchronize,
 )
-from papera.checkpoints import load_strict_full_checkpoint
+from consistworld_runtime.checkpoints import load_consistworld_warm_start
 
 
 def compute_density_for_timestep_sampling(
@@ -195,7 +196,7 @@ def sync_tensor_for_sp(tensor: torch.Tensor, sp_group):
 
 @dataclass
 class Stage1ARTrainingConfig(TrainingConfig):
-    """Fixed training recipe used for PaperA."""
+    """Fixed training recipe used for ConsistWorld."""
 
     chunk_size: int = 4
 
@@ -220,18 +221,19 @@ class Stage1ARTrainingConfig(TrainingConfig):
 
 class LingbotStage1ARTrainer:
     def __init__(self, config: Stage1ARTrainingConfig):
+        require_accelerator("Training")
         self.config = config
         if not config.clip_cache_dir:
             raise ValueError("--clip_cache_dir is required")
         if int(config.sr_local_attn_size) != int(config.chunk_size):
             raise ValueError(
-                "PaperA uses a one-chunk rolling window: "
+                "ConsistWorld uses a one-chunk rolling window: "
                 "sr_local_attn_size must equal chunk_size"
             )
         if int(config.sr_sink_size) != 0:
-            raise ValueError("PaperA uses the shared image as its only sink (sr_sink_size=0)")
+            raise ValueError("ConsistWorld uses the shared image as its only sink (sr_sink_size=0)")
         if int(config.chunk_size) != 4:
-            raise ValueError("PaperA uses chunk_size=4")
+            raise ValueError("ConsistWorld uses chunk_size=4")
         self.wan_config = WAN_CONFIGS["i2v-A14B"]
         self.device = torch.device(device_type)
 
@@ -375,9 +377,14 @@ class LingbotStage1ARTrainer:
 
         # Load a full architecture-matched warm start before checkpoint/FSDP wrapping.
         if init_pt:
-            load_strict_full_checkpoint(model, init_pt)
+            initialized = load_consistworld_warm_start(model, init_pt)
             if self.is_main_process:
-                print(f"[train] strict warm-start loaded from {init_pt}", flush=True)
+                suffix = (
+                    f"; initialized {len(initialized)} zero P-Mem marker tensors"
+                    if initialized
+                    else ""
+                )
+                print(f"[train] strict warm-start loaded from {init_pt}{suffix}", flush=True)
 
         # Gradient checkpointing must not depend on the warm-start path: apply it
         # whenever the flag is on (base-safetensors loads included), before FSDP.
@@ -689,7 +696,15 @@ class LingbotStage1ARTrainer:
         )
 
     def _rollout_layout(self, chunk: int, position: int, num_views: int) -> dict:
-        layout = {"chunk_size": chunk, "tgt_abs_chunks": [position + 1]}
+        # Self-resampling always re-encodes exactly the preceding committed
+        # chunk. Keep the window explicit so rollout cannot silently fall back
+        # to the model's full-history default if that default changes.
+        layout = {
+            "chunk_size": chunk,
+            "tgt_abs_chunks": [position + 1],
+            "window_chunks": 1,
+            "sink_chunks": 0,
+        }
         gates = getattr(self, "_xnow_rollout", None)
         if gates:
             per_view = [gates.get((view, position)) for view in range(num_views)]
@@ -747,7 +762,7 @@ class LingbotStage1ARTrainer:
         ftok = gh * gw
 
         if not extra or "latents_tgt" not in extra:
-            raise ValueError("PaperA batches require a packed multi-view target")
+            raise ValueError("ConsistWorld batches require a packed multi-view target")
         target_latents_by_view = extra["latents_tgt"].to(self.device)
         target_conditions_by_view = extra["cond_tgt"].to(self.device)
         target_controls_by_view = extra["control_tgt"].to(self.device)
@@ -805,7 +820,7 @@ class LingbotStage1ARTrainer:
         hist_cond = cond_y
         hist_ctrl_tensor = control_tensor
         if num_chunks < 2:
-            raise ValueError("rolling PaperA training needs clips with at least two chunks")
+            raise ValueError("rolling ConsistWorld training needs clips with at least two chunks")
         # Keep only the previous chunk for each target position. The final history
         # chunk is never read and is intentionally omitted.
         frames_per_view = num_chunks * chunk
@@ -852,7 +867,7 @@ class LingbotStage1ARTrainer:
         }
 
         if not extra or "latents_source" not in extra:
-            raise ValueError("PaperA batches require the shared source-image stream")
+            raise ValueError("ConsistWorld batches require the shared source-image stream")
         src_lat = extra["latents_source"].to(self.device).contiguous()
         src_cond = extra["cond_source"].to(self.device).contiguous()
         src_ctrl = extra["control_source"].to(self.device).contiguous()
@@ -878,7 +893,7 @@ class LingbotStage1ARTrainer:
         # Each target view reads only its own top-1 retrieved history entry. The
         # cache enforces the anti-leak bound ``candidate_chunk <= query_chunk - 2``.
         if "mem_pairs" not in extra:
-            raise ValueError("PaperA batches require per-view P-Mem pairs")
+            raise ValueError("ConsistWorld batches require per-view P-Mem pairs")
         mp = extra["mem_pairs"].to("cpu", torch.long)
         if mp.ndim != 4 or mp.shape[0] != num_chunks or mp.shape[1] != num_views or mp.shape[3] != 2:
             raise ValueError(
@@ -939,7 +954,7 @@ class LingbotStage1ARTrainer:
     def _self_resample_history_kv(self, context, a_b_emb, a_g_emb, history_clean_16, cond_y_full,
                                   chunk_text_idx, lat_h, lat_w, num_views, control_dict,
                                   latents_source, indices_source):
-        """Run the multi-view rolling self-resample used by PaperA training.
+        """Run the multi-view rolling self-resample used by ConsistWorld training.
 
         Per chunk j (all k views JOINTLY): noise the clean chunk j at a clean-biased
         sigma_h, condition on the accumulated DEGRADED history (this view's own x̂
@@ -1031,7 +1046,7 @@ class LingbotStage1ARTrainer:
                 eps = self._sync_for_sp(torch.randn_like(cj))
                 z_v.append((1.0 - sigma_h) * cj + sigma_h * eps)
             z = torch.cat(z_v, dim=2)                  # [1,16,k*chunk,h,w]
-            # PaperA always uses the immediately preceding generated chunk as
+            # ConsistWorld always uses the immediately preceding generated chunk as
             # history. The source image remains in its own fixed stream.
             kept = [jj - 1] if jj > 0 else []
             slots, jj_eff = ([0] if kept else []), 1
@@ -1164,7 +1179,7 @@ class LingbotStage1ARTrainer:
             pred_tf_list, pred_bi_list = self.single_dit.model(**model_kwargs)
             pred_tf = torch.stack(pred_tf_list, dim=0)
             if pred_bi_list is not None:
-                raise RuntimeError("PaperA training must not return a bidirectional branch")
+                raise RuntimeError("ConsistWorld training must not return a bidirectional branch")
 
         loss = self._masked_flow_loss(pred_tf, inputs["target"], inputs["sigmas"])
 
@@ -1349,7 +1364,7 @@ class LingbotStage1ARTrainer:
 
 def create_dataloader(config: Stage1ARTrainingConfig):
     if not config.clip_cache_dir:
-        raise ValueError("--clip_cache_dir is required; PaperA trains from the packed clip cache")
+        raise ValueError("--clip_cache_dir is required; ConsistWorld trains from the packed clip cache")
     from wan.dataset.clip_cache_assembler import ClipCacheConsumer
 
     return ClipCacheConsumer(
@@ -1367,7 +1382,7 @@ def create_dataloader(config: Stage1ARTrainingConfig):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train PaperA from a packed multi-view clip cache")
+    parser = argparse.ArgumentParser(description="Train ConsistWorld from a packed multi-view clip cache")
     parser.add_argument("--pretrained_model_root", required=True)
     parser.add_argument("--init_model_pt", required=True,
                         help="Stage-1 rolling base checkpoint (model_full.pt)")

@@ -1,4 +1,4 @@
-"""Run PaperA multi-view autoregressive inference on an authored trajectory."""
+"""Run ConsistWorld multi-view autoregressive inference on an authored trajectory."""
 from __future__ import annotations
 
 import argparse
@@ -10,15 +10,22 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from papera.checkpoints import load_strict_full_checkpoint
-from papera.inference_utils import camera_control, load_camera, load_trajectory
+from consistworld_runtime.checkpoints import load_strict_full_checkpoint
+from consistworld_runtime.inference_utils import camera_control, load_camera, load_trajectory
 from wan.commons.parallel_states import initialize_parallel_state
 from wan.configs import WAN_CONFIGS
 from wan.dataset.pmem_retrieval import rank_mem_candidates, token_xnow_gate
 from wan.modules.model_ar import WanModelAR
 from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae2_1 import Wan2_1_VAE
-from wan.utils.accel import device_module, device_type, empty_cache, is_npu, manual_seed_all
+from wan.utils.accel import (
+    device_module,
+    device_type,
+    empty_cache,
+    is_npu,
+    manual_seed_all,
+    require_accelerator,
+)
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from wan.utils.infer_data import ResizeCropAspectCenter
 from wan.utils.prompt_template import compose_scene_text_condition
@@ -37,6 +44,10 @@ def parse_target_cameras(value: str) -> list[str]:
     cameras = [item.strip() for item in value.split(",") if item.strip()]
     if not cameras:
         raise ValueError("--target_cams must contain at least one camera")
+    if len(set(cameras)) != len(cameras):
+        raise ValueError("--target_cams must not contain duplicate camera names")
+    if len(cameras) > 4:
+        raise ValueError("ConsistWorld was trained with at most four target cameras")
     return cameras
 
 
@@ -92,9 +103,10 @@ def load_first_frame(path: str, resize_crop: ResizeCropAspectCenter, device: tor
 
 
 def initialize_single_process() -> torch.device:
+    require_accelerator("Inference")
     if dist.is_initialized():
         if dist.get_world_size() != 1:
-            raise RuntimeError("PaperA release inference supports one process")
+            raise RuntimeError("ConsistWorld release inference supports one process")
     else:
         os.environ.setdefault("RANK", "0")
         os.environ.setdefault("WORLD_SIZE", "1")
@@ -427,6 +439,8 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
         layout = {
             "chunk_size": CHUNK_SIZE,
             "tgt_abs_chunks": [2],
+            "window_chunks": WINDOW_CHUNKS,
+            "sink_chunks": 0,
             "xnow_gate": gate,
         }
         if selected_memory:
@@ -482,7 +496,7 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
                         num_views=len(targets),
                     )
                 if bidirectional_prediction is not None:
-                    raise RuntimeError("PaperA inference must not produce a bidirectional branch")
+                    raise RuntimeError("ConsistWorld inference must not produce a bidirectional branch")
                 sample = scheduler.step(
                     prediction[0].float().unsqueeze(0), timestep, sample, return_dict=False
                 )[0]
@@ -510,7 +524,7 @@ def run(args: argparse.Namespace, device: torch.device) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the released PaperA inference recipe")
+    parser = argparse.ArgumentParser(description="Run the released ConsistWorld inference recipe")
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--pretrained_model_root", required=True)
     parser.add_argument("--data_root", required=True)

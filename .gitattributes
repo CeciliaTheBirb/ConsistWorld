@@ -1,0 +1,2 @@
+# Unified patches encode blank context lines with a leading space.
+infinigen/patches/*.patch -whitespace

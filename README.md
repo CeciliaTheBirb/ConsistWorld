@@ -1,63 +1,132 @@
-# PaperA
+# ConsistWorld
 
-This is a compact release of the PaperA multi-view autoregressive training,
-cache-building, checkpoint-conversion, and inference path. It contains only the
-code used by the final recipe. Experimental services, router-style extensions,
-ablations, evaluation outputs, and data are deliberately excluded.
+ConsistWorld is a multi-view, autoregressive video recipe built on
+[lingbot-world-v2-14b-causal-fast](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast).
+This release contains the actual cache builder, the three training stages,
+P-Mem retrieval, the cross-view attention gate, checkpoint conversion, and
+joint multi-camera inference. It also contains a small, reproducible
+Infinigen CPU-preparation and GPU-rendering workflow under
+[`infinigen/`](infinigen/README.md).
 
-## Training Lineage
+The 14B model is not practical on a CPU. Cache construction, training, and
+inference require CUDA or Ascend NPU; CPU-only hosts can run metadata, format,
+trajectory, and checkpoint-format checks. The entry points fail early with a
+clear error when no supported accelerator is available.
 
-PaperA has two high-level training stages. Stage 1 builds the multi-view rolling
-capability on MultiCamData; Stage 2 adapts it to rendered revisit trajectories.
+## Recipe Lineage
 
-| Phase | Data and recipe | Checkpoint used downstream |
+| Phase | Data and behavior | Checkpoint used next |
 | --- | --- | --- |
 | Foundation | `lingbot-world-v2-14b-causal-fast` | foundation model |
-| Stage 1A | MultiCamData / `multicam_vipe_f18`; shared first image, 1-4 target views, one-chunk rolling teacher forcing, bidirectional loss | `window_rolling_ckpt6000_model_full.pt` |
-| Stage 1B | Same MultiCamData; SR-v3 continuation with four rollout steps and rho linearly ramped from 0 to 0.4 over 4000 steps | selected step 4000: `sr_v3_ckpt4000_model_full.pt` |
-| Stage 2 | Rendered Infinigen multi-camera revisit data | selected step 3000 from the 4000-step PaperA run |
+| Stage 1A | MultiCamData `multicam_vipe_f18`; shared first image, 1-4 target views, one-chunk rolling teacher forcing, bidirectional loss | step 6000 |
+| Stage 1B | Same data; four-step self-resampling rollout, rho linearly ramped from 0 to 0.4 over 4000 steps | step 4000 |
+| Stage 2 | Rendered Infinigen revisit clips; P-Mem and cross-view attention gate enabled | available final checkpoint: step 3000 |
 
-`train_multicam_base.py` is Stage 1A. `train_multicam_stage1.py` is Stage 1B
-and starts from the Stage 1A checkpoint. `train_papera.py` is Stage 2 and starts
-from the selected Stage 1B checkpoint.
+The original Stage 1B run continued to 6000 steps, but the portable warm start
+used by ConsistWorld is its step-4000 checkpoint. Stage 2 was configured for 4000
+steps but received SIGTERM after saving checkpoint 3000. Do not describe that
+checkpoint as the result of a completed 4000-step run.
 
-The fixed Stage 2 recipe is:
+The Stage 2 defaults in `train_consistworld.py` reproduce the released recipe:
 
-- latent chunks of four frames; up to nine chunks per view
-- one shared source-image chunk and one rolling history chunk per target view
-- 1-4 target views, with at most 20 target-view chunks per step
-- per-view top-1 pose retrieval with `candidate_chunk <= query_chunk - 2`
-- geometry gate ramped from 0 to 1 over the first 500 steps
-- self-resampling with four rollout steps, shift 0.25, and rho from 0 to 0.2
-  over 4000 steps
-- no learned view identity embedding and no bidirectional loss
-- full-model fine-tuning with learning rate `1e-5`, 100-step warmup, gradient
-  accumulation 2, sequence parallel size 8, and one 16-device FSDP replica
+- 4 latent frames per chunk, nine chunks per input view, and 1-4 target views;
+- a shared first-image source chunk plus one rolling history chunk per target;
+- top-1 P-Mem independently selected for each target view, with candidates
+  restricted to `candidate_chunk <= query_chunk - 2`;
+- a parameter-free cross-view-current gate ramped from 0 to 1 over 500 steps;
+- four-step self-resampling with rho ramped from 0 to 0.2 over 4000 steps;
+- full-model fine-tuning at `1e-5`, 100 warmup steps, and gradient accumulation
+  of 2. No learned view identity embedding or bidirectional loss is used here.
 
-## Environment
+The retained `mem_key_marker` is the active, zero-initialized P-Mem key tag in
+the original final model. Experimental ORE, router, and related branches are
+not part of this release.
 
-Install the Python dependencies in an accelerator-enabled environment:
+## Setup
+
+Install dependencies in an accelerator-enabled environment:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-The original runs used 16 Ascend NPUs. CUDA requires a compatible attention
-backend; Ascend requires the matching `torch_npu` and CANN runtime. `ffmpeg` is
-needed for MP4 output. The model root must contain the original transformer
-configuration, VAE, and T5 files from `lingbot-world-v2-14b-causal-fast`.
+The original training used 16 Ascend NPUs. CUDA requires a compatible attention
+backend; the conservative reference setting below works on the original NPU
+path:
 
-For the original NPU attention path, set `LINGBOT_MOBA_ATTN=loop`. Run all
-commands below from this directory.
+```bash
+export LINGBOT_MOBA_ATTN=loop
+```
+
+For the original-scale run, use 16 devices with `sp_size=8` and
+`dp_replicate=1`. This gives a world mesh of DP=2 x SP=8; the FSDP mesh keeps
+one replica dimension and shards across all 16 ranks. Smaller configurations
+are not an equivalent reproduction of the 21.79B full-finetuning run.
+
+The model root must contain the upstream `transformers/` configuration, VAE,
+T5 weights, and tokenizer. The upstream project is
+[lingbot-world-v2](https://github.com/robbyant/lingbot-world-v2).
+
+## Data Contract
+
+Both MultiCamData and converted Infinigen data use the same SpatialVID layout.
+Each scene has at least two paired files, recursively under a data root:
+
+```text
+<scene>__cam01.mp4
+<scene>__cam01.json
+<scene>__cam02.mp4
+<scene>__cam02.json
+```
+
+Each JSON must contain normalized `intrinsics_vipe` and OpenCV
+world-to-camera `poses_w2c_vipe`:
+
+```json
+{
+  "intrinsics_vipe": [[fx_norm, 0, cx_norm], [0, fy_norm, cy_norm], [0, 0, 1]],
+  "poses_w2c_vipe": [[[...], [...], [...], [...]]],
+  "caption": {"SceneDescription": "optional scene description"}
+}
+```
+
+The loader converts poses to camera-to-world internally and applies the same
+center crop and intrinsic transform during cache building and inference. Video
+lengths are rounded down to `1 + 4*n` RGB frames for the Wan temporal stride.
+This is a model-format check, not an arbitrary dataset restriction: each
+four-frame latent chunk requires a complete temporal-VAE window, and each usable
+RGB frame must have a matching pose. For example, a 144-frame Infinigen render
+supplies 141 usable frames, which is 36 latents or nine ConsistWorld chunks.
+
+Validate a dataset before allocating the VAE or text encoder:
+
+```bash
+python infinigen/validate_multicam.py \
+  --data_root /path/to/multicam_data \
+  --expected_views 8 --expected_frames 141
+```
+
+Use `--expected_views 0` when validating a MultiCamData root with a varying
+number of cameras.
+
+## Repository Layout
+
+`consistworld_runtime/` contains the small release-specific runtime package:
+
+- `checkpoints.py` strictly loads, normalizes, and converts full-model
+  checkpoints, including the zero-initialized P-Mem key marker compatibility
+  rule;
+- `inference_utils.py` reads the common SpatialVID camera format, converts
+  poses, constructs camera controls, and validates authored trajectories.
+
+The actual model implementation remains under `wan/`; the training, cache, and
+inference entry points stay at the repository root. This keeps release-only
+runtime and data-contract helpers separate from the model implementation.
 
 ## Build Caches
 
-The cache builder reads SpatialVID-style paired files named
-`<scene>__camNN.mp4` and `<scene>__camNN.json`. Each JSON must provide
-`intrinsics_vipe` and `poses_w2c_vipe`. It writes one packed scene under
-`clips/` and its text embedding under `text/`.
-
-Build the five-chunk MultiCamData cache for Stage 1:
+Run cache construction once for each source dataset. It writes packed scene
+latents to `clips/` and text embeddings to `text/`.
 
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 build_clip_cache.py \
@@ -67,19 +136,18 @@ LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 build_clip_cache.py \
   --target_height 240 --target_width 416 --max_chunks 5
 ```
 
-Build the nine-chunk cache for Stage 2 from the rendered revisit dataset:
-
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 build_clip_cache.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
   --navigation_roots /path/to/rendered_revisit_data \
-  --out_dir /path/to/papera_cache \
+  --out_dir /path/to/consistworld_cache \
   --target_height 240 --target_width 416 --max_chunks 9
 ```
 
-## Stage 1: MultiCamData
+## Train
 
-Train the rolling teacher-forced initializer from the foundation model:
+Stage 1A trains the rolling teacher-forced initializer from the foundation
+model:
 
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_multicam_base.py \
@@ -89,77 +157,103 @@ LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_multicam_base.py \
   --sp_size 8 --dp_replicate 1 --max_steps 6000 --save_interval 250
 ```
 
-Use `checkpoint-6000/model_full.pt` as the Stage 1B initializer. Continue with
-SR-v3 and select its step-4000 portable checkpoint as
-`sr_v3_ckpt4000_model_full.pt`:
+Stage 1B continues from `checkpoint-6000/model_full.pt`. The command below
+stops at the selected step-4000 warm start:
 
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_multicam_stage1.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
   --init_model_pt /path/to/multicam_base_output/checkpoint-6000/model_full.pt \
   --clip_cache_dir /path/to/multicam_cache \
-  --output_dir /path/to/multicam_sr_v3_output \
-  --sp_size 8 --dp_replicate 1 --max_steps 6000 --save_interval 250
+  --output_dir /path/to/multicam_sr_output \
+  --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 250
 ```
 
-## Stage 2: Rendered Revisit Data
+Stage 2 adapts that warm start on the rendered Infinigen cache:
 
 ```bash
-LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_papera.py \
+LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_consistworld.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
-  --init_model_pt /path/to/sr_v3_ckpt4000_model_full.pt \
-  --clip_cache_dir /path/to/papera_cache \
-  --output_dir /path/to/papera_output \
+  --init_model_pt /path/to/multicam_sr_output/checkpoint-4000/model_full.pt \
+  --clip_cache_dir /path/to/consistworld_cache \
+  --output_dir /path/to/consistworld_output \
   --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 500
 ```
 
-All trainers write portable `checkpoint-<step>/model_full.pt` files. The release
-loads them strictly; missing or extra model tensors are errors rather than being
-silently initialized or ignored.
+All trainers save portable `checkpoint-<step>/model_full.pt` files. Old Stage
+1 checkpoints that predate the P-Mem marker can only omit those zero-init
+tensors during a warm start; any other missing or unexpected tensor is an
+error.
 
-## Convert the Final Checkpoint
+## Convert A Final Checkpoint
 
-The original final PaperA checkpoint contains legacy extension tensors that are
-not present in this release, including the removed memory marker. It cannot be
-loaded directly. Convert it once against the clean Stage 1B checkpoint:
+The private final ConsistWorld checkpoint has experimental tensors that are not part
+of the public architecture. Convert it once before publishing it. The converter
+retains every released core tensor, including `mem_key_marker`, validates
+shapes, and refuses to discard an unrecognized tensor.
 
 ```bash
-python convert_papera_checkpoint.py \
-  --source /path/to/raw/paperA_mem_20260901/checkpoint-3000/model_full.pt \
-  --reference /path/to/sr_v3_ckpt4000_model_full.pt \
-  --out /path/to/papera_clean_checkpoint-3000/model_full.pt
+python convert_consistworld_checkpoint.py \
+  --source /path/to/raw_consistworld/checkpoint-3000/model_full.pt \
+  --reference /path/to/multicam_sr_output/checkpoint-4000/model_full.pt \
+  --out /path/to/consistworld_checkpoint-3000/model_full.pt
 ```
 
-The converter keeps only the exact Stage 1B model ABI, validates every retained
-tensor shape, and rejects unknown extras. Publish only the converted checkpoint
-with this code. Removing the legacy extension tensors intentionally changes the
-model, so the clean checkpoint is suitable for reproducing the released
-architecture and recipe, not for bit-identical reproduction of the raw
-extension checkpoint's videos.
+`infer_consistworld.py` loads the converted final checkpoint strictly. This keeps a
+published weight file tied to the released ABI instead of silently ignoring
+architecture differences.
 
 ## Inference
 
-The trajectory JSON must define `n_chunks`, `n_frames`, and an absolute c2w pose
-sequence for each target camera in `views[].poses`.
+Create a trajectory by replaying camera poses from either MultiCamData or
+converted Infinigen data. The helper emits absolute camera-to-world poses and
+limits the result to a valid common video prefix.
 
 ```bash
-LINGBOT_MOBA_ATTN=loop python infer_papera.py \
-  --ckpt /path/to/papera_clean_checkpoint-3000/model_full.pt \
-  --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
-  --data_root /path/to/multicam_vipe_f18 \
-  --scene f18_aperture10__scene4 \
-  --src_cam cam01 --target_cams cam02,cam03 \
-  --trajectory /path/to/trajectory.json \
-  --first_frame_image /path/to/first_frame.png \
-  --out /path/to/output.mp4 --seed 2027048 --sampling_steps 30
+python make_trajectory_from_multicam.py \
+  --data_root /path/to/multicam_data \
+  --scene infngn_michar8_example \
+  --target_cams cam02,cam03 \
+  --n_chunks 9 \
+  --out /path/to/trajectory.json
 ```
 
-All target views are generated jointly. Retrieval is per target view and the
-retrieved history is materialized only for the corresponding inference step.
+Then jointly generate the requested target views. The source video supplies
+the conditioning first frame unless `--first_frame_image` is set.
 
-## Release Scope and Licensing
+```bash
+LINGBOT_MOBA_ATTN=loop python infer_consistworld.py \
+  --ckpt /path/to/consistworld_checkpoint-3000/model_full.pt \
+  --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
+  --data_root /path/to/multicam_data \
+  --scene infngn_michar8_example \
+  --src_cam cam01 --target_cams cam02,cam03 \
+  --trajectory /path/to/trajectory.json \
+  --out /path/to/output.mp4 --seed 42 --sampling_steps 30
+```
 
-This repository includes no model weights, data, trajectories, experiment logs,
-or rendered videos. It is distributed under the upstream CC BY-NC-SA 4.0 terms
-in `LICENSE.txt`. Files with separate upstream terms and their attributions are
-listed in `THIRD_PARTY_NOTICES.md`.
+Inference is intentionally single-process. It keeps one generated history
+chunk per target view, materializes each selected P-Mem anchor in the source
+tail for that denoise step, and performs retrieval independently for every
+target view.
+
+## Infinigen Data
+
+See [`infinigen/README.md`](infinigen/README.md) for the complete CPU scene
+preparation, sequential GPU rendering, conversion, and validation workflow.
+It uses the minimal eight-rig, in-place "mi-character" sweep from the earlier
+pipeline and intentionally excludes private supervisors, hard-coded paths,
+background services, and destructive cleanup behavior.
+
+## Verification Scope
+
+The release has been checked with command-line parsing, Python syntax checks,
+P-Mem layout and checkpoint compatibility tests, Infinigen-to-SpatialVID
+conversion, decoded MP4 dimensions, and dataset validation. A full 14B cache,
+training, or inference run still requires a compatible CUDA GPU or Ascend NPU;
+it cannot be truthfully verified on a CPU-only host.
+
+## License
+
+The release follows the terms in [`LICENSE.txt`](LICENSE.txt). Upstream and
+third-party notices are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

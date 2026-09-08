@@ -7,6 +7,8 @@ text/
 cache/
 checkpoints/
 outputs/
+infinigen_work/
+rendered_revisit_data/
 *.pt
 *.pth
 *.safetensors

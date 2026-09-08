@@ -1,4 +1,4 @@
-"""Assemble one PaperA multi-view training item from a packed clip cache."""
+"""Assemble one ConsistWorld multi-view training item from a packed clip cache."""
 from __future__ import annotations
 
 import glob
@@ -96,7 +96,7 @@ def _conditioning_stream(
 
 
 class ClipCacheConsumer:
-    """Infinite rank-strided iterable over shared-image PaperA examples.
+    """Infinite rank-strided iterable over shared-image ConsistWorld examples.
 
     Each item selects one fixed source camera and a random number of target
     cameras in ``[k_min, k_max]``. The source contributes only its first image
@@ -118,13 +118,13 @@ class ClipCacheConsumer:
         chunk_size: int = 4,
     ) -> None:
         if int(chunk_size) != 4:
-            raise ValueError("PaperA uses chunk_size=4")
+            raise ValueError("ConsistWorld uses chunk_size=4")
         if not 1 <= int(k_min) <= int(k_max):
             raise ValueError(f"invalid target-view range [{k_min}, {k_max}]")
         if int(target_chunks) < 2:
             raise ValueError("target_chunks must be at least two for rolling training")
         if int(pmem_r) != 1:
-            raise ValueError("PaperA uses one retrieved chunk per target view")
+            raise ValueError("ConsistWorld uses one retrieved chunk per target view")
 
         self.clips_dir = os.path.join(clip_cache_dir, "clips")
         self.text_dir = os.path.join(clip_cache_dir, "text")

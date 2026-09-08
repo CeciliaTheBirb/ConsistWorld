@@ -1,4 +1,4 @@
-"""Deterministic per-view P-Mem retrieval for PaperA."""
+"""Deterministic per-view P-Mem retrieval for ConsistWorld."""
 import numpy as np
 import torch
 

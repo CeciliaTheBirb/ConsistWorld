@@ -1,0 +1,89 @@
+diff --git a/src/infinigen/core/placement/camera_trajectories.py b/src/infinigen/core/placement/camera_trajectories.py
+index a37a0aa4..f1cd4d1e 100644
+--- a/src/infinigen/core/placement/camera_trajectories.py
++++ b/src/infinigen/core/placement/camera_trajectories.py
+@@ -6,6 +6,7 @@
+ # - Sumanth Maddirala: base view selection
+ 
+ import logging
++import os
+ from copy import deepcopy
+ from functools import partial
+ 
+@@ -201,6 +202,65 @@ def compute_trajectories(
+     return sorted(trajectory_proposals, reverse=True)[:n_cams]
+ 
+ 
++def _michar_sweep_walk(cam_rigs, base_views, scene_preprocessed, fatal):
++    """Keyframe the release's eight-view in-place angular sweep.
++
++    Rig ``k`` follows the yaw/pitch axis at ``k * 45`` degrees.  Opposite
++    rigs traverse the same axis in opposite order.  Every rig shares the
++    validated first base-view position, which makes the rendered cameras a
++    synchronized multi-view revisit sequence rather than unrelated walks.
++    """
++    import math
++
++    from mathutils import Vector
++
++    if not base_views:
++        if fatal:
++            raise ValueError("INFNGN_MICHAR_SWEEP: no base views")
++        return
++    scene = bpy.context.scene
++    start, end = scene.frame_start, scene.frame_end
++    _, proposal, focus = base_views[0]
++    location = Vector(proposal.loc)
++    pitch, roll, yaw = (float(proposal.rot[0]), float(proposal.rot[1]), float(proposal.rot[2]))
++
++    first_amplitude = math.radians(10.0)
++    second_amplitude = math.radians(20.0)
++    # This corresponds to world elevation in [-35, +5] degrees.  Shift an
++    # entire rig's pitch trajectory into the interval rather than clamping
++    # its individual keyframes, which would make the pure-pitch rigs static.
++    pitch_min, pitch_max = math.radians(55.0), math.radians(95.0)
++    phase_fractions = (0.0, 0.42, 1.0)
++
++    for rig_index, cam_rig in enumerate(cam_rigs):
++        axis = math.radians(45.0 * (rig_index % 8))
++        yaw_weight, pitch_weight = math.cos(axis), math.sin(axis)
++        offsets = (
++            (0.0, 0.0),
++            (first_amplitude * yaw_weight, first_amplitude * pitch_weight),
++            (-second_amplitude * yaw_weight, -second_amplitude * pitch_weight),
++        )
++        raw_pitch = [pitch + delta_pitch for _, delta_pitch in offsets]
++        if min(raw_pitch) < pitch_min:
++            pitch_shift = pitch_min - min(raw_pitch)
++        elif max(raw_pitch) > pitch_max:
++            pitch_shift = pitch_max - max(raw_pitch)
++        else:
++            pitch_shift = 0.0
++
++        cam_rig.location = location
++        cam_rig.keyframe_insert(data_path="location", frame=start)
++        cam_rig.keyframe_insert(data_path="location", frame=end)
++        for fraction, (delta_yaw, delta_pitch) in zip(phase_fractions, offsets):
++            frame = int(round(start + fraction * (end - start)))
++            cam_rig.rotation_euler = (pitch + delta_pitch + pitch_shift, roll, yaw + delta_yaw)
++            cam_rig.keyframe_insert(data_path="rotation_euler", frame=frame)
++        if focus is not None:
++            for camera in cam_rig.children:
++                if camera.type == "CAMERA":
++                    camera.data.dof.focus_distance = focus
++
++
+ @gin.configurable
+ def animate_trajectories(
+     cam_rigs,
+@@ -213,6 +274,10 @@ def animate_trajectories(
+ ):
+     bpy.context.view_layer.update()
+ 
++    if os.environ.get("INFNGN_MICHAR_SWEEP") == "1" and base_views:
++        return _michar_sweep_walk(cam_rigs, base_views, scene_preprocessed, fatal)
++
++
+     try:
+         trajectories = compute_trajectories(
+             cam_rigs=cam_rigs,

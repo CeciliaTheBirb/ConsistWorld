@@ -1,4 +1,4 @@
-"""Camera and checkpoint-independent helpers used by PaperA inference."""
+"""Camera and checkpoint-independent helpers used by ConsistWorld inference."""
 from __future__ import annotations
 
 import json

@@ -1,1 +1,0 @@
-"""PaperA public helpers."""

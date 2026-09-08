@@ -1,4 +1,4 @@
-"""Device adapter for CUDA / Ascend NPU.
+"""Device adapter for CUDA, Ascend NPU, and CPU-only validation.
 
 Provides a single source of truth for `device_type` / `device_module` so the rest
 of the code can stay device-agnostic.
@@ -15,7 +15,10 @@ from torch._utils import _get_available_device_type, _get_device_module
 def _detect() -> tuple[str, Any]:
     dtype = _get_available_device_type()
     if dtype is None:
-        dtype = "cuda"
+        # Keep imports and argument parsing usable on a CPU-only host.  The
+        # entry points that require a 14B accelerator run call
+        # ``require_accelerator`` before allocating a model.
+        dtype = "cpu"
     mod = _get_device_module(dtype)
     return dtype, mod
 
@@ -32,6 +35,21 @@ def is_npu() -> bool:
 
 def is_cuda() -> bool:
     return device_type == "cuda"
+
+
+def has_accelerator() -> bool:
+    """Whether a supported CUDA or Ascend device is available."""
+    return device_type in {"cuda", "npu"}
+
+
+def require_accelerator(operation: str) -> None:
+    """Fail before model construction when an accelerator is unavailable."""
+    if has_accelerator():
+        return
+    raise RuntimeError(
+        f"{operation} requires a CUDA GPU or Ascend NPU. "
+        "CPU-only execution is supported only for metadata and format checks."
+    )
 
 
 def current_device() -> int:
@@ -74,6 +92,8 @@ __all__ = [
     "device_module",
     "is_npu",
     "is_cuda",
+    "has_accelerator",
+    "require_accelerator",
     "current_device",
     "empty_cache",
     "synchronize",

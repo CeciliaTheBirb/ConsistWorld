@@ -1,4 +1,4 @@
-"""Local SpatialVID reader used to build a PaperA clip cache."""
+"""Local SpatialVID reader used to build a ConsistWorld clip cache."""
 from __future__ import annotations
 
 import json

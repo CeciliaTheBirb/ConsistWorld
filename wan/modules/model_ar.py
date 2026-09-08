@@ -140,6 +140,34 @@ def rope_apply_token_freqs(x, token_freqs):
     return torch.view_as_real(x_complex).flatten(3).float()
 
 
+def _local_mem_key_marker(mem_key_marker, local_num_heads, sp_size=1, sp_rank=0):
+    """Return the marker block that matches this sequence-parallel head shard."""
+    if mem_key_marker is None:
+        return None
+    if mem_key_marker.ndim != 2:
+        raise ValueError(
+            "mem_key_marker must be [num_heads, head_dim], got "
+            f"{tuple(mem_key_marker.shape)}"
+        )
+    local_num_heads = int(local_num_heads)
+    sp_size = int(sp_size)
+    sp_rank = int(sp_rank)
+    if mem_key_marker.shape[0] == local_num_heads:
+        return mem_key_marker
+    if (
+        sp_size > 1
+        and mem_key_marker.shape[0] == local_num_heads * sp_size
+        and 0 <= sp_rank < sp_size
+    ):
+        start = sp_rank * local_num_heads
+        return mem_key_marker[start : start + local_num_heads]
+    raise ValueError(
+        "mem_key_marker head count does not match attention heads: "
+        f"marker={mem_key_marker.shape[0]}, local={local_num_heads}, sp_size={sp_size}, "
+        f"sp_rank={sp_rank}"
+    )
+
+
 @torch.amp.autocast(device_type, enabled=False)
 def rope_apply_sequence_parallel(x, grid_sizes, freqs, sp_size, sp_rank):
     local_seq_len = x.size(1)
@@ -249,6 +277,7 @@ class WanSelfAttention(nn.Module):
         grid_sizes,
         freqs,
         causal_layout=None,
+        mem_key_marker=None,
     ):
         batch_size, seq_len, num_heads, head_dim = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -289,7 +318,13 @@ class WanSelfAttention(nn.Module):
             raise ValueError("WanSelfAttention requires a chunk-causal layout (uniform AR only)")
         mv_groups = causal_layout.get("mv_groups")
         if mv_groups is not None:
-            x = moba_self_attention_groups(q, k, v, mv_groups)
+            local_marker = _local_mem_key_marker(
+                mem_key_marker,
+                k.shape[2],
+                parallel_dims.sp if parallel_dims.sp_enabled else 1,
+                parallel_dims.sp_rank if parallel_dims.sp_enabled else 0,
+            )
+            x = moba_self_attention_groups(q, k, v, mv_groups, local_marker)
             if causal_layout.get("xnow_gate") is not None:
                 x = gated_cross_now(
                     q,
@@ -298,6 +333,7 @@ class WanSelfAttention(nn.Module):
                     x,
                     causal_layout["mv_groups_without_peer"],
                     causal_layout["xnow_gate"],
+                    local_marker,
                 )
         else:
             x = moba_self_attention(
@@ -375,6 +411,11 @@ class WanAttentionBlock(nn.Module):
 
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        # The final ConsistWorld recipe gives retrieved P-Mem keys a small, zero-init
+        # per-head marker. It distinguishes retrieval keys from phase-zero
+        # rolling-history keys while preserving the Stage-1 warm start exactly.
+        self.mem_key_marker = nn.Parameter(torch.zeros(num_heads, dim // num_heads))
+
         self.cam_injector_layer1 = nn.Linear(dim, dim)
         self.cam_injector_layer2 = nn.Linear(dim, dim)
         self.cam_scale_layer = nn.Linear(dim, dim)
@@ -430,6 +471,7 @@ class WanAttentionBlock(nn.Module):
             grid_sizes,
             freqs,
             causal_layout=causal_layout,
+            mem_key_marker=self.mem_key_marker,
         )
         with torch.amp.autocast(device_type, dtype=torch.float32):
             x = x + y * e[2].squeeze(2)
@@ -929,6 +971,9 @@ class WanModelAR(ModelMixin, ConfigMixin):
         sink_tok = s_tok - mem_src * ct
         if mem_src > 0 and sink_tok < 0:
             raise ValueError(f"mem_src_chunks={mem_src} exceeds source stream ({s_tok} tokens)")
+        # Each group is (query_start, query_end, ordinary_key_ranges,
+        # memory_key_ranges). Keeping P-Mem separate lets attention tag only
+        # retrieved keys; it is deliberately not applied to the rolling window.
         groups = []
         src0 = 0
         histk0 = s_tok
@@ -941,9 +986,11 @@ class WanModelAR(ModelMixin, ConfigMixin):
         for c in range(cs):
             q0 = src0 + c * ct
             if mem_src > 0 and q0 >= sink_tok:
-                groups.append((q0, q0 + ct, [(q0, q0 + ct)]))
+                groups.append((q0, q0 + ct, [(q0, q0 + ct)], []))
             else:
-                groups.append((q0, q0 + ct, [(src0, sink_tok if mem_src > 0 else s_tok)]))
+                groups.append(
+                    (q0, q0 + ct, [(src0, sink_tok if mem_src > 0 else s_tok)], [])
+                )
         # per-view history: block-causal within its own view. Windowed/rolling mode
         # (win>0): each history chunk attends ONLY ITSELF — at rollout the kept
         # prev chunk is re-encoded alone, and rolling slots give every history
@@ -953,9 +1000,12 @@ class WanModelAR(ModelMixin, ConfigMixin):
             for c in range(ch):
                 if win > 0:
                     groups.append((base + c * ct, base + (c + 1) * ct,
-                                   [(base + c * ct, base + (c + 1) * ct)]))
+                                   [(base + c * ct, base + (c + 1) * ct)], []))
                 else:
-                    groups.append((base + c * ct, base + (c + 1) * ct, [(base, base + (c + 1) * ct)]))
+                    groups.append(
+                        (base + c * ct, base + (c + 1) * ct,
+                         [(base, base + (c + 1) * ct)], [])
+                    )
         # per-view target
         for v in range(k):
             tbase = tf0 + v * tv_tok
@@ -963,6 +1013,7 @@ class WanModelAR(ModelMixin, ConfigMixin):
                 qs = tbase + t * ct
                 qe = qs + ct
                 ranges = []
+                memory_ranges = []
                 if s_tok > 0:                       # WHOLE source (non-causal)
                     s_end = sink_tok if mem_src > 0 else s_tok
                     if s_end > 0:
@@ -996,7 +1047,7 @@ class WanModelAR(ModelMixin, ConfigMixin):
                                 f"hist_chunks={hv_tok // ct})"
                             )
                         mb = histk0 + w_m * hv_tok + c_m * ct
-                        ranges.append((mb, mb + ct))
+                        memory_ranges.append((mb, mb + ct))
                 if mem_src > 0 and mem_src_sets is not None:
                     for m in mem_src_sets[t][v]:
                         if not (0 <= m < mem_src):
@@ -1005,11 +1056,11 @@ class WanModelAR(ModelMixin, ConfigMixin):
                                 f"[0, {mem_src})"
                             )
                         mb = sink_tok + m * ct
-                        ranges.append((mb, mb + ct))
-                groups.append((qs, qe, ranges))
+                        memory_ranges.append((mb, mb + ct))
+                groups.append((qs, qe, ranges, memory_ranges))
         if use_bi:
             bi0 = tf0 + k * tv_tok
-            groups.append((bi0, bi0 + k * tv_tok, [(bi0, bi0 + k * tv_tok)]))
+            groups.append((bi0, bi0 + k * tv_tok, [(bi0, bi0 + k * tv_tok)], []))
         return groups
 
     def _build_time_embeddings(self, t, batch_size, target_seq_len, history_seq_len, device, history_timestep):

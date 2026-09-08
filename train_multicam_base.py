@@ -1,11 +1,11 @@
-"""Train the MultiCamData rolling teacher-forced initializer for PaperA."""
+"""Train the MultiCamData rolling teacher-forced initializer for ConsistWorld."""
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
 
 from train_multicam_stage1 import MultiCamStage1Config, MultiCamStage1Trainer
-from train_papera import create_dataloader
+from train_consistworld import create_dataloader
 
 
 @dataclass

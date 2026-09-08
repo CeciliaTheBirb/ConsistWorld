@@ -1,1 +1,1 @@
-"""PaperA utility modules."""
+"""ConsistWorld utility modules."""

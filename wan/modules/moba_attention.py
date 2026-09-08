@@ -187,31 +187,55 @@ def moba_self_attention(q, k, v, chunk_tok, num_hist, tgt_abs, include_bi=True):
 
 # --------------------------------------------------------------------------- #
 # Generalized self-attention driven by explicit query groups. Each group is
-# ``(q_start, q_end, kv_ranges)`` and groups tile the sequence in order.
+# ``(q_start, q_end, kv_ranges, mem_ranges)`` and groups tile the sequence in
+# order. ``mem_ranges`` are appended with a per-head marker on their keys.
 # --------------------------------------------------------------------------- #
 def _gather_ranges(t0, ranges):
     return torch.cat([t0[s:e] for (s, e) in ranges], dim=0)
 
 
-def _self_loop_groups(q, k, v, groups):
+def _mark_memory_keys(keys, marker, leading_dims: int):
+    if marker is None:
+        return keys
+    marker = marker.to(device=keys.device, dtype=keys.dtype)
+    if tuple(marker.shape) != tuple(keys.shape[-2:]):
+        raise ValueError(
+            "mem_key_marker must match local [heads, head_dim]: "
+            f"marker={tuple(marker.shape)}, key={tuple(keys.shape)}"
+        )
+    return keys + marker[(None,) * int(leading_dims)]
+
+
+def _self_loop_groups(q, k, v, groups, mem_key_marker=None):
     outs = []
-    for (qs, qe, kv_ranges) in groups:
-        kc = torch.cat([k[:, s:e] for (s, e) in kv_ranges], dim=1)
-        vc = torch.cat([v[:, s:e] for (s, e) in kv_ranges], dim=1)
+    for qs, qe, kv_ranges, mem_ranges in groups:
+        keys = [k[:, s:e] for s, e in kv_ranges]
+        values = [v[:, s:e] for s, e in kv_ranges]
+        for start, end in mem_ranges:
+            keys.append(_mark_memory_keys(k[:, start:end], mem_key_marker, 2))
+            values.append(v[:, start:end])
+        kc = torch.cat(keys, dim=1)
+        vc = torch.cat(values, dim=1)
         outs.append(flash_attention(q[:, qs:qe], kc, vc))
     return torch.cat(outs, dim=1)
 
 
-def _self_varlen_groups(q, k, v, groups):
+def _self_varlen_groups(q, k, v, groups, mem_key_marker=None):
     assert q.size(0) == 1, "MoBA varlen path assumes B=1"
     q0, k0, v0 = q[0], k[0], v[0]
     ql, kl, kp, vp = [], [], [], []
     off = 0
-    for (qs, qe, kv_ranges) in groups:
+    for qs, qe, kv_ranges, mem_ranges in groups:
         assert qs == off, f"self-attn groups must tile [0,L) in order (gap at {qs}!={off})"
         ql.append(qe - qs)
         kk = _gather_ranges(k0, kv_ranges)
         vv = _gather_ranges(v0, kv_ranges)
+        if mem_ranges:
+            kk = torch.cat(
+                [kk, _mark_memory_keys(_gather_ranges(k0, mem_ranges), mem_key_marker, 1)],
+                dim=0,
+            )
+            vv = torch.cat([vv, _gather_ranges(v0, mem_ranges)], dim=0)
         kp.append(kk); vp.append(vv); kl.append(kk.size(0))
         off = qe
     k_packed = torch.cat(kp, dim=0)
@@ -222,15 +246,15 @@ def _self_varlen_groups(q, k, v, groups):
     return out.unsqueeze(0).type(q.dtype)
 
 
-def moba_self_attention_groups(q, k, v, groups):
-    """Generalized self-attention over explicit query groups."""
+def moba_self_attention_groups(q, k, v, groups, mem_key_marker=None):
+    """Generalized self-attention over explicit query and P-Mem groups."""
     impl = moba_impl()
     if impl == "varlen" and (is_npu() or (FLASH_ATTN_4_AVAILABLE and _fa4_varlen is not None)):
-        return _self_varlen_groups(q, k, v, groups)
-    return _self_loop_groups(q, k, v, groups)
+        return _self_varlen_groups(q, k, v, groups, mem_key_marker)
+    return _self_loop_groups(q, k, v, groups, mem_key_marker)
 
 
-def gated_cross_now(q, k, v, x_full, groups_without_peer, gate):
+def gated_cross_now(q, k, v, x_full, groups_without_peer, gate, mem_key_marker=None):
     """Blend full attention with attention that excludes peer-current keys.
 
     The geometry gate belongs only to the equal-time cross-view cell.  Re-running
@@ -248,12 +272,17 @@ def gated_cross_now(q, k, v, x_full, groups_without_peer, gate):
         )
 
     out = x_full
-    for qs, qe, key_ranges in groups_without_peer:
+    for qs, qe, key_ranges, mem_ranges in groups_without_peer:
         weights = gate[qs:qe]
         if bool((weights >= 1.0).all()):
             continue
-        keys = torch.cat([k[:, start:end] for start, end in key_ranges], dim=1)
-        values = torch.cat([v[:, start:end] for start, end in key_ranges], dim=1)
+        keys = [k[:, start:end] for start, end in key_ranges]
+        values = [v[:, start:end] for start, end in key_ranges]
+        for start, end in mem_ranges:
+            keys.append(_mark_memory_keys(k[:, start:end], mem_key_marker, 2))
+            values.append(v[:, start:end])
+        keys = torch.cat(keys, dim=1)
+        values = torch.cat(values, dim=1)
         without_peer = flash_attention(q[:, qs:qe], keys, values)
         blend = weights[None, :, None, None]
         out = torch.cat(
