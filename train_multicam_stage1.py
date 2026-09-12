@@ -1,4 +1,4 @@
-"""Train the MultiCamData rolling SR-v3 warm start used by ConsistWorld."""
+"""Train the MultiCamData rolling SR warm start used by ConsistWorld."""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +21,6 @@ from wan.utils.stage1_ar_selfresample import ar_seq_len, rho_curriculum
 
 @dataclass
 class MultiCamStage1Config(Stage1ARTrainingConfig):
-    """The fixed rolling recipe that produced the Stage-1 ConsistWorld initializer."""
 
     max_steps: int = 6000
     warmup_steps: int = 500

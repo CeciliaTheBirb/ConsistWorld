@@ -10,7 +10,7 @@ from train_consistworld import create_dataloader
 
 @dataclass
 class MultiCamBaseConfig(MultiCamStage1Config):
-    """Fixed MultiCamData recipe before the SR-v3 continuation."""
+    """Fixed MultiCamData recipe before the SR continuation."""
 
     max_steps: int = 6000
     self_resample: bool = False

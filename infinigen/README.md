@@ -8,9 +8,6 @@ pipeline:
 3. convert RGB frames and camera metadata to the SpatialVID/MultiCamData format;
 4. validate the converted clips before ConsistWorld cache construction.
 
-It intentionally does not include the private job supervisors, machine-specific
-paths, background processes, or destructive cleanup scripts from the production
-pipeline.
 
 ## Prerequisites
 
@@ -94,8 +91,3 @@ python validate_multicam.py \
   --expected_views 8 --expected_frames 141
 ```
 
-The renderer produces 144 RGB frames. ConsistWorld uses the largest `1 + 4*n` prefix,
-so 141 usable frames become 36 VAE latents and nine four-latent chunks.
-
-The top-level [`README.md`](../README.md) documents cache construction, Stage
-1/2 training, and inference using the resulting data.
