@@ -28,7 +28,7 @@ LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_multicam_base.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
   --clip_cache_dir /path/to/multicam_cache \
   --output_dir /path/to/multicam_base_output \
-  --sp_size 8 --dp_replicate 1 --max_steps 6000 --save_interval 250
+  --sp_size 8 --dp_replicate 1 --max_steps 6000 --save_interval 1000
 ```
 
 Stage 1B continues training with self resampling:
@@ -36,10 +36,10 @@ Stage 1B continues training with self resampling:
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_multicam_stage1.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
-  --init_model_pt /path/to/multicam_base_output/checkpoint-6000/model_full.pt \
+  --init_model_pt /path/to/multicam_base_output/checkpoint/model_full.pt \
   --clip_cache_dir /path/to/multicam_cache \
   --output_dir /path/to/multicam_sr_output \
-  --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 250
+  --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 1000
 ```
 
 Stage 2 adapts that warm start on the rendered Infinigen cache:
@@ -47,10 +47,10 @@ Stage 2 adapts that warm start on the rendered Infinigen cache:
 ```bash
 LINGBOT_MOBA_ATTN=loop torchrun --nproc_per_node=16 train_consistworld.py \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
-  --init_model_pt /path/to/multicam_sr_output/checkpoint-4000/model_full.pt \
+  --init_model_pt /path/to/multicam_sr_output/checkpoint/model_full.pt \
   --clip_cache_dir /path/to/consistworld_cache \
   --output_dir /path/to/consistworld_output \
-  --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 500
+  --sp_size 8 --dp_replicate 1 --max_steps 4000 --save_interval 1000
 ```
 
 ## Inference
@@ -71,7 +71,7 @@ the conditioning first frame unless `--first_frame_image` is set.
 
 ```bash
 LINGBOT_MOBA_ATTN=loop python infer_consistworld.py \
-  --ckpt /path/to/consistworld_checkpoint-3000/model_full.pt \
+  --ckpt /path/to/consistworld_checkpoint/model_full.pt \
   --pretrained_model_root /path/to/lingbot-world-v2-14b-causal-fast \
   --data_root /path/to/multicam_data \
   --scene infngn_michar8_example \
