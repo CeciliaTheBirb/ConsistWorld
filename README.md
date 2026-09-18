@@ -1,12 +1,33 @@
 # ConsistWorld
 
-ConsistWorld is a multi-agent, autoregressive video recipe built on
-[lingbot-world-v2-14b-causal-fast](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast).
+ConsistWorld is a multi-agent autoregressive video world model built on
+[lingbot-world-v2-14b-causal-fast](https://huggingface.co/robbyant/lingbot-world-v2-14b-causal-fast). It combines Pose Conditioned Memory Retrieval for recalling relevant historical evidence across agents with Visibility-Gated Peer Sharing for coordinating concurrent views.
 
+<h3 align="center">
+  One Source Image + Independent Camera Trajectories = One Consistent Shared World
+</h3>
 
 ![ConsistWorld qualitative results](assets/teaser.png)
 
 
+
+### Consistent World Generation & Exploration
+
+<table>
+
+  <tr>
+    <td>
+      <a href="assets/example1.mp4">
+        <img src="assets/example1.gif" width="100%" alt="Example 1">
+      </a>
+    </td>
+    <td>
+      <a href="assets/example2.mp4">
+        <img src="assets/example2.gif" width="100%" alt="Example 2">
+      </a>
+    </td>
+  </tr>
+</table>
 
 ## Setup
 
